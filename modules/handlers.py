@@ -22,6 +22,14 @@ from .telegram_utils import send_message
 
 logger = setup_logging()
 
+def _topic_id_from(update: Update) -> int:
+    """
+    Возвращает идентификатор темы (topic/thread) для супергрупп.
+    Для ЛС и групп без форумов возвращает 0.
+    Мы в проекте договорились хранить 'нет темы' как 0 (а не NULL).
+    """
+    return getattr(update.effective_message, "message_thread_id", 0) or 0
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, conn):
     user = update.effective_user
     chat = update.effective_chat
@@ -29,6 +37,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, conn):
     message_id = update.effective_message.message_id
 
     if chat_id < 0:
+        # Группа
         if not is_group_welcomed(conn, chat_id):
             full = await context.bot.get_chat(chat_id)
             legal_id = register_legal_entity(chat_id, full.title, getattr(full, "description", None))
@@ -47,6 +56,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, conn):
         await send_message(context, chat_id, "Готово! Для каждой темы можно создать свою заявку.", message_id,
                            reply_markup={"keyboard": kb, "resize_keyboard": True})
     else:
+        # Личные чаты — регистрация пользователя
         row = conn.execute("SELECT intradesk_user_id FROM users WHERE user_id = ? AND chat_id = ?", (user.id, chat_id)).fetchone()
         if row:
             kb = [["Создать заявку", "Открытые заявки"]]
@@ -61,7 +71,7 @@ async def create_ticket_handler(update: Update, context: ContextTypes.DEFAULT_TY
     chat = update.effective_chat
     chat_id = chat.id
     message_id = update.effective_message.message_id
-    topic_id = getattr(update.effective_message, "message_thread_id", 0) or 0
+    topic_id = _topic_id_from(update)
 
     row = conn.execute("SELECT intradesk_user_id, legal_entity_id FROM users WHERE user_id = ? AND chat_id = ?",
                        (user.id, chat_id)).fetchone()
@@ -70,6 +80,7 @@ async def create_ticket_handler(update: Update, context: ContextTypes.DEFAULT_TY
     legal_id = get_legal_entity_id(conn, chat_id) if chat_id < 0 else None
 
     if chat_id < 0:
+        # Группа: работаем через сервисного пользователя
         if not legal_id:
             await send_message(context, chat_id, "Ошибка: чат не зарегистрирован как юр. лицо.", message_id)
             return
@@ -80,6 +91,7 @@ async def create_ticket_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 return
             force_uid = group_uid
     else:
+        # Личные: требуем регистрацию пользователя
         if not row:
             context.user_data["awaiting_inn"] = True
             await send_message(context, chat_id, "Пожалуйста, введите ИНН вашей организации (10 или 12 цифр):", message_id)
@@ -93,22 +105,49 @@ async def create_ticket_handler(update: Update, context: ContextTypes.DEFAULT_TY
         r = conn.execute("SELECT task_number FROM tickets WHERE ticket_id = ?", (ticket_id,)).fetchone()
         task_number = r["task_number"] if r else "Unknown"
         save_ticket(conn, ticket_id, task_number, chat_id, user.id, message_id, message_id, last_updated or "", status)
+
         if chat_id < 0:
+            # Ключевой момент: для групп/тем создаём ЖЁСТКУЮ привязку темы к заявке
             bind_thread_ticket(conn, chat_id, topic_id, ticket_id, user.id)
+
         sent = await send_message(context, chat_id, f"Заявка #{task_number} создана. Опишите проблему.", message_id,
                                   reply_markup={"keyboard": [["Открытые заявки"]], "resize_keyboard": True})
         if sent:
             conn.execute("UPDATE tickets SET message_id = ? WHERE ticket_id = ?", (sent.message_id, ticket_id))
             conn.commit()
-        context.user_data["active_ticket"] = ticket_id
+
+        # ВАЖНО: активную заявку в user_data ставим ТОЛЬКО в личных чатах.
+        if chat_id > 0:
+            context.user_data["active_ticket"] = ticket_id
     else:
         await send_message(context, chat_id, result, message_id)
 
 async def list_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE, conn):
-    user = update.effective_user
-    chat_id = update.effective_chat.id
+    """
+    ЛС: показываем личные открытые заявки пользователя в этом чате.
+    Группы: если есть текущая тема с привязкой — показываем именно её (чтобы не путать контекст).
+    """
+    chat = update.effective_chat
+    chat_id = chat.id
     message_id = update.effective_message.message_id
 
+    # Ветка для групп/тем — показываем привязанную к теме заявку, если есть
+    if chat_id < 0:
+        topic_id = _topic_id_from(update)
+        t = get_thread_ticket(conn, chat_id, topic_id)
+        if not t:
+            await send_message(context, chat_id, "В этой теме заявка не привязана. Используйте «Создать заявку» или /bind.", message_id)
+            return
+        row = conn.execute("SELECT task_number, status FROM tickets WHERE ticket_id = ?", (t,)).fetchone()
+        if not row:
+            await send_message(context, chat_id, "Заявка привязана, но отсутствует в локальной БД (нужно обновить).", message_id)
+            return
+        st = get_status_name_by_id(conn, row["status"]) or row["status"]
+        await send_message(context, chat_id, f"Эта тема связана с заявкой #{row['task_number']} (статус: {st}).", message_id)
+        return
+
+    # Личные чаты — как было
+    user = update.effective_user
     rows = conn.execute(
         "SELECT ticket_id, task_number, status FROM tickets WHERE user_id = ? AND chat_id = ? AND status NOT IN (?, ?, ?)",
         (user.id, chat_id, 99220, 99219, 99216),
@@ -126,26 +165,24 @@ async def list_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE, conn)
         text += f"• #{num} — {status_text}\n"
         keyboard.append([InlineKeyboardButton(f"Заявка #{num}", callback_data=f"continue_{r['ticket_id']}")])
 
-    sent = await send_message(context, chat_id, text, message_id, reply_markup=InlineKeyboardMarkup(keyboard))
-    if sent:
-        with conn:
-            for r in rows:
-                conn.execute("UPDATE tickets SET message_id = ? WHERE ticket_id = ?", (sent.message_id, r["ticket_id"]))
-            conn.commit()
+    # ВАЖНО: не переписываем message_id для всех заявок одним значением.
+    await send_message(context, chat_id, text, message_id, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, conn):
     user = update.effective_user
     chat = update.effective_chat
     chat_id = chat.id
     message_id = update.effective_message.message_id
-    topic_id = getattr(update.effective_message, "message_thread_id", 0) or 0
+    topic_id = _topic_id_from(update)
     text = update.effective_message.text
 
+    # Кнопки/команды
     if text == "Создать заявку" or (text and text.strip().lower() == "/new"):
         await create_ticket_handler(update, context, conn); return
     if text == "Открытые заявки" or (text and text.strip().lower() in ("/list", "/tickets")):
         await list_tickets(update, context, conn); return
 
+    # Регистрация по ИНН — только для ЛС
     if chat_id > 0 and context.user_data.get("awaiting_inn"):
         inn = (text or "").strip()
         if not re.match(r"^\d{10}$|^\d{12}$", inn):
@@ -164,11 +201,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, con
                            reply_markup={"keyboard": kb, "resize_keyboard": True})
         return
 
+    # В ЛС проверяем, что пользователь зарегистрирован
     if chat_id > 0:
         row = conn.execute("SELECT intradesk_user_id FROM users WHERE user_id = ? AND chat_id = ?", (user.id, chat_id)).fetchone()
         if not row:
             await send_message(context, chat_id, "Пожалуйста, используйте /start для регистрации!", message_id); return
 
+    # Парсинг вложений
     file_path = None
     if update.effective_message.photo:
         photo = await update.effective_message.photo[-1].get_file()
@@ -189,13 +228,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, con
     elif not text:
         text = "Сообщение без текста"
 
+    # Определяем заявку по контексту
     if chat_id < 0:
+        # ГРУППЫ/ТЕМЫ: только привязка threads, НЕ используем user_data.active_ticket
         mapped_ticket = get_thread_ticket(conn, chat_id, topic_id)
         if not mapped_ticket:
             if text and not text.startswith("/"):
                 kb = [["Создать заявку", "Открытые заявки"]]
-                await send_message(context, chat_id, "Для этой темы нет заявки. Нажмите «Создать заявку».", message_id,
-                                   reply_markup={"keyboard": kb, "resize_keyboard": True})
+                await send_message(
+                    context, chat_id,
+                    "Для этой темы нет заявки. Нажмите «Создать заявку».",
+                    message_id, reply_markup={"keyboard": kb, "resize_keyboard": True}
+                )
             if file_path and os.path.exists(file_path):
                 try: os.remove(file_path)
                 except Exception: pass
@@ -204,10 +248,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, con
         author = user.full_name or user.username or str(user.id)
         text = f"[{author}] {text}" if text else f"[{author}]"
     else:
+        # ЛИЧНЫЕ: сначала явная активная (если есть), затем любая открытая в этом чате
         ticket_id = context.user_data.get("active_ticket") or has_open_ticket(conn, user.id, chat_id)
 
+    # Добавляем комментарий (и файл при наличии)
     if ticket_id:
         if add_comment_to_ticket(conn, ticket_id, user.id, chat_id, text, file_path, message_id):
+            # Подчистим служебное сообщение для ЭТОЙ заявки (если оно было)
             row = conn.execute("SELECT message_id FROM tickets WHERE ticket_id = ?", (ticket_id,)).fetchone()
             ticket_message_id = row["message_id"] if row else None
             if ticket_message_id:
@@ -226,10 +273,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, con
         except Exception: pass
 
 async def handle_ticket_choice(update: Update, context: ContextTypes.DEFAULT_TYPE, conn):
+    """
+    Колбэк из «Открытые заявки».
+    ВАЖНО:
+    - в группах/темах — привязываем текущую ТЕМУ к выбранной заявке (bind_thread_ticket),
+      НЕ трогаем context.user_data;
+    - в ЛС — ставим active_ticket в user_data.
+    """
     query = update.callback_query
     await query.answer()
     user = query.from_user
-    chat_id = query.message.chat_id
+    chat = query.message.chat
+    chat_id = chat.id
+    topic_id = getattr(query.message, "message_thread_id", 0) or 0
 
     action, *params = query.data.split("_")
     if action == "continue":
@@ -237,8 +293,16 @@ async def handle_ticket_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         row = conn.execute("SELECT task_number, message_id FROM tickets WHERE ticket_id = ?", (ticket_id,)).fetchone()
         task_number = row["task_number"] if row else "Unknown"
         ticket_message_id = row["message_id"] if row else None
+
+        if chat_id < 0:
+            # Привязываем текущую тему к выбранной заявке
+            bind_thread_ticket(conn, chat_id, topic_id, ticket_id, user.id)
+        else:
+            # Личные — помним активную
+            context.user_data["active_ticket"] = ticket_id
+
         await query.edit_message_text(f"Выбрана заявка #{task_number}. Добавьте комментарий.")
-        context.user_data["active_ticket"] = ticket_id
+
         if ticket_message_id:
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=ticket_message_id)
@@ -246,15 +310,18 @@ async def handle_ticket_choice(update: Update, context: ContextTypes.DEFAULT_TYP
                 conn.commit()
             except Exception as e:
                 logger.warning("Не удалось удалить сообщение %s: %s", ticket_message_id, e)
+
     elif action == "new":
         user_id, chat_id2 = map(int, params)
         if user_id != user.id:
             await query.edit_message_text("Нельзя создавать заявку от имени другого пользователя.")
             return
+
         force_uid = None
         if chat_id2 < 0:
             legal_id = get_legal_entity_id(conn, chat_id2)
             force_uid = ensure_group_default_user(conn, chat_id2, legal_id, query.message.chat.title) if legal_id else None
+
         ticket_id, last_updated, status, result = create_ticket(
             conn, "Ожидание описания", "Ожидание описания", user.id, chat_id2,
             query.message.chat.title if chat_id2 < 0 else None, force_intradesk_user_id=force_uid
@@ -263,10 +330,14 @@ async def handle_ticket_choice(update: Update, context: ContextTypes.DEFAULT_TYP
             row = conn.execute("SELECT task_number FROM tickets WHERE ticket_id = ?", (ticket_id,)).fetchone()
             task_number = row["task_number"] if row else "Unknown"
             save_ticket(conn, ticket_id, task_number, chat_id2, user.id, query.message.message_id, query.message.message_id, last_updated or "", status)
-            context.user_data["active_ticket"] = ticket_id
+
+            # Привязка темы для групп
             if chat_id2 < 0:
-                topic_id = getattr(query.message, "message_thread_id", 0) or 0
-                bind_thread_ticket(conn, chat_id2, topic_id, ticket_id, user.id)
+                topic_id2 = getattr(query.message, "message_thread_id", 0) or 0
+                bind_thread_ticket(conn, chat_id2, topic_id2, ticket_id, user.id)
+            else:
+                context.user_data["active_ticket"] = ticket_id
+
             await query.edit_message_text(f"Заявка #{task_number} создана. Опишите проблему.")
         else:
             await query.edit_message_text(result)
@@ -302,7 +373,7 @@ async def cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE, conn):
     chat_id = update.effective_chat.id
     if chat_id > 0:
         await send_message(context, chat_id, "Команда доступна только в группах."); return
-    topic_id = getattr(update.effective_message, "message_thread_id", 0) or 0
+    topic_id = _topic_id_from(update)
     args = (update.effective_message.text or "").split()
     if len(args) < 2:
         await send_message(context, chat_id, "Используйте: /bind <номер_заявки> (например, /bind 287)"); return
@@ -317,7 +388,7 @@ async def cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE, conn):
 
 async def cmd_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE, conn):
     chat_id = update.effective_chat.id
-    topic_id = getattr(update.effective_message, "message_thread_id", 0) or 0
+    topic_id = _topic_id_from(update)
     if chat_id < 0:
         t = get_thread_ticket(conn, chat_id, topic_id)
         if not t:
@@ -334,7 +405,7 @@ async def cmd_unbind(update: Update, context: ContextTypes.DEFAULT_TYPE, conn):
     chat_id = update.effective_chat.id
     if chat_id > 0:
         await send_message(context, chat_id, "Команда доступна только в группах."); return
-    topic_id = getattr(update.effective_message, "message_thread_id", 0) or 0
+    topic_id = _topic_id_from(update)
     from .db import unbind_thread_ticket
     unbind_thread_ticket(conn, chat_id, topic_id)
     await send_message(context, chat_id, "Привязка этой темы к заявке снята.")

@@ -119,8 +119,10 @@ def has_open_ticket(conn: sqlite3.Connection, user_id: int, chat_id: int) -> Opt
 # threads
 def bind_thread_ticket(conn: sqlite3.Connection, chat_id: int, topic_id: int, ticket_id: str, created_by: int) -> None:
     with conn:
-        conn.execute("INSERT OR REPLACE INTO threads (chat_id, topic_id, ticket_id, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-                     (chat_id, topic_id, ticket_id, created_by, datetime.datetime.utcnow().isoformat()))
+        conn.execute(
+            "INSERT OR REPLACE INTO threads (chat_id, topic_id, ticket_id, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, topic_id, ticket_id, created_by, datetime.datetime.utcnow().isoformat())
+        )
         conn.commit()
 
 def get_thread_ticket(conn: sqlite3.Connection, chat_id: int, topic_id: int) -> Optional[str]:
@@ -159,6 +161,18 @@ def get_group_default_user_id(conn: sqlite3.Connection, chat_id: int) -> Optiona
     return row["group_default_user_id"] if row else None
 
 def set_group_default_user_id(conn: sqlite3.Connection, chat_id: int, intradesk_user_id: str) -> None:
+    """
+    Безопасно обновляет group_default_user_id:
+    - если строка есть — UPDATE,
+    - если нет — INSERT с минимальным набором полей.
+    """
     with conn:
-        conn.execute("UPDATE groups SET group_default_user_id = ? WHERE chat_id = ?", (intradesk_user_id, chat_id))
+        cur = conn.cursor()
+        cur.execute("UPDATE groups SET group_default_user_id = ? WHERE chat_id = ?", (intradesk_user_id, chat_id))
+        if cur.rowcount == 0:
+            # Строки ещё нет — создаём
+            conn.execute(
+                "INSERT INTO groups (chat_id, group_default_user_id, welcomed) VALUES (?, ?, 0)",
+                (chat_id, intradesk_user_id)
+            )
         conn.commit()
