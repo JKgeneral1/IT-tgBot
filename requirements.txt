@@ -1,0 +1,16 @@
+# Telegram API (PTB v20.8 + extras)
+python-telegram-bot[job-queue,webhooks]==20.8
+
+# Веб-сервер для idk_webhook
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+aiohttp==3.9.5     # нужен для webhooks в PTB (FastAPI сам по себе не требует aiohttp)
+
+# HTTP-запросы
+requests==2.31.0
+
+# Повторные попытки/бектoff
+tenacity==8.2.3
+
+# Работа со временем
+pytz==2024.1
