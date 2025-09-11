@@ -2,6 +2,8 @@
 """
 idk_webhook.py — приёмник вебхуков от IntraDesk (FastAPI).
 Парсит комментарии и статусы; шлёт сообщения в Telegram; хранит минимум в SQLite.
+
+Изменение: отключены уведомления о смене статуса.
 """
 
 import asyncio
@@ -14,7 +16,7 @@ import re
 import sqlite3
 from collections import deque
 from hashlib import sha1
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pytz
 from fastapi import FastAPI, Request, HTTPException
@@ -34,6 +36,7 @@ IDK_PORT: int = int(config.get("Web", "idk_port", fallback="8081"))
 DB_FILE = config.get("App", "db_file", fallback="/data/tickets.db")
 TG_LIMIT = int(config.get("App", "tg_limit", fallback="3500"))
 
+# Можно оставить для внутреннего логирования/совместимости, но в Telegram не используем
 STATUSES = {
     106939: "Открыта", 106941: "Переоткрыта", 106940: "Отложена", 106948: "Требует уточнения",
     106951: "В работе", 106946: "Выполнена", 106947: "ВыполнTest", 106943: "Проверена",
@@ -108,6 +111,8 @@ def update_ticket_status(ticket_id: str, new_status: Optional[int]) -> bool:
     with DB:
         DB.execute("UPDATE tickets SET status = COALESCE(?, status), last_updated = ? WHERE ticket_id = ?",
                    (new_status, datetime.datetime.now(UTC).isoformat(), ticket_id))
+    if changed:
+        log.info("Status changed for ticket %s: %s -> %s (%s)", ticket_id, old, new_status, STATUSES.get(new_status))
     return changed
 
 # ---- utils ----
@@ -159,16 +164,14 @@ def chunk_text(text: str, limit: int = TG_LIMIT) -> List[str]:
         parts.append(buf)
     return parts
 
-async def tg_send(bot: Bot, chat_id: int, text: str, reply_to_message_id: Optional[int]) -> None:
+async def tg_send(bot: Bot, chat_id: int, text: str) -> None:
+    """Отправляет обычные сообщения без reply_to."""
     pieces = chunk_text(text)
     total = len(pieces)
     for i, piece in enumerate(pieces, start=1):
         piece_to_send = piece if total == 1 else (piece if i == 1 else f"(продолжение {i}/{total})\n{piece}")
         try:
-            if reply_to_message_id:
-                await bot.send_message(chat_id, piece_to_send, reply_to_message_id=reply_to_message_id)
-            else:
-                await bot.send_message(chat_id, piece_to_send)
+            await bot.send_message(chat_id, piece_to_send)
         except RetryAfter as e:
             await asyncio.sleep(e.retry_after)
             await bot.send_message(chat_id, piece_to_send)
@@ -310,7 +313,6 @@ async def idk_webhook(request: Request):
         return JSONResponse({"ok": False, "error": "ticket not found in bot db"}, status_code=404)
 
     chat_id = int(row["chat_id"])
-    reply_to = int(row["last_user_message_id"]) if row["last_user_message_id"] else None
     task_number = row["task_number"]
 
     candidates = collect_comment_candidates(payload)
@@ -323,20 +325,16 @@ async def idk_webhook(request: Request):
     status = pick_status(payload)
     status_changed = update_ticket_status(ticket_id, status)
 
+    # --- Отправка в TG ---
     try:
-        if status_changed:
-            status_name = STATUSES.get(status, f"#{status}")
-            if chosen_comment:
-                msg = f"Обновление по заявке #{task_number}\n\nСтатус: {status_name}\n\nКомментарий инженера:\n{chosen_comment}"
-                await tg_send(BOT, chat_id, msg, reply_to)
-            else:
-                await tg_send(BOT, chat_id, f"Обновление по заявке #{task_number}\n\nСтатус: {status_name}", None)
-        else:
-            if chosen_comment:
-                await tg_send(BOT, chat_id, f"Ответ инженера по заявке #{task_number}\n\n{chosen_comment}", reply_to)
+        # Больше не уведомляем о смене статуса.
+        # Если пришёл комментарий инженера — отправляем только его текст.
+        if chosen_comment:
+            await tg_send(BOT, chat_id, f"{chosen_comment}")
     except Exception:
         log.exception("Ошибка отправки в Telegram")
 
+    # Чистим кэш комментариев пользователя при финальных статусах
     if status is not None and status in FINAL_STATUSES:
         clear_user_comments(ticket_id)
 
