@@ -125,6 +125,9 @@ REOPEN_MAP_ON_COMMENT: Dict[int, int] = _parse_status_map(
     config["App"].get("reopen_map_on_comment", "106940->106939,106948->106939")
 )
 
+# Вкл/выкл периодический опрос IntraDesk (cron)
+ENABLE_STATUS_POLLING: bool = config["App"].getboolean("enable_status_polling", fallback=False)
+
 
 # Webhook / Web
 PUBLIC_BASE = config["Webhook"].get("public_base", "").rstrip("/")
@@ -1380,11 +1383,17 @@ def main() -> None:
 
         app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-        # Jobs
         jq = app.job_queue
-        jq.run_repeating(lambda ctx: asyncio.create_task(check_ticket_status(ctx, conn)), interval=5, first=5)
-        # midnight UTC
+
+        # Опрос IntraDesk отключаем по умолчанию (включается флагом в config.ini)
+        if ENABLE_STATUS_POLLING:
+           jq.run_repeating(lambda ctx: asyncio.create_task(check_ticket_status(ctx, conn)), interval=5, first=5)
+           logger.info("IntraDesk polling ENABLED (every 5s).")
+        else:
+           logger.info("IntraDesk polling DISABLED (enable_status_polling=0).")
+
         jq.run_daily(clear_logs_job, time=dt.time(hour=0, minute=0, tzinfo=pytz.UTC))
+
 
         # Handlers
         app.add_handler(CommandHandler("start", lambda upd, ctx: start(upd, ctx, conn)))
