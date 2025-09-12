@@ -120,12 +120,20 @@ def clear_user_comments(ticket_id: str) -> None:
 
 
 def user_comment_exists(ticket_id: str, text: str) -> bool:
-    norm = _normalize_for_db(text)
-    row = DB.execute(
-        "SELECT 1 FROM user_comments WHERE ticket_id = ? AND comment_text = ?",
-        (ticket_id, norm),
-    ).fetchone()
-    return row is not None
+    """
+    Проверяем, что такой же пользовательский комментарий уже есть в БД.
+    Сравнение по нормализованной форме (убираем ZWJ/VS и схлопываем пробелы),
+    чтобы цепочки эмодзи не давали эхо.
+    """
+    target = _normalize_for_db(text)
+    rows = DB.execute(
+        "SELECT comment_text FROM user_comments WHERE ticket_id = ?",
+        (ticket_id,),
+    ).fetchall()
+    for r in rows or []:
+        if _normalize_for_db(r["comment_text"]) == target:
+            return True
+    return False
 
 
 def save_user_comment_db(ticket_id: str, text: str) -> None:
