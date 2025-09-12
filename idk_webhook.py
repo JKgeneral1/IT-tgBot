@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 import pytz
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
-from telegram import Bot
+from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import RetryAfter, Forbidden
 
 # ---- конфиг ----
@@ -33,18 +33,33 @@ IDK_SECRET_HEADER: str = config.get("IDK", "secret_header", fallback="x-api-key"
 IDK_SECRET_VALUE: str = config.get("IDK", "secret_value", fallback="")
 IDK_HOST: str = config.get("Web", "idk_host", fallback="0.0.0.0")
 IDK_PORT: int = int(config.get("Web", "idk_port", fallback="8081"))
-DB_FILE = config.get("App", "db_file", fallback="/data/tickets.db")
-TG_LIMIT = int(config.get("App", "tg_limit", fallback="3500"))
+DB_FILE: str = config.get("App", "db_file", fallback="/data/tickets.db")
+TG_LIMIT: int = int(config.get("App", "tg_limit", fallback="3500"))
 
 # Можно оставить для внутреннего логирования/совместимости, но в Telegram не используем
-STATUSES = {
-    106939: "Открыта", 106941: "Переоткрыта", 106940: "Отложена", 106948: "Требует уточнения",
-    106951: "В работе", 106946: "Выполнена", 106947: "ВыполнTest", 106943: "Проверена",
-    106942: "ВыполнProd", 106945: "Сделка (заключен договор)", 106950: "Закрыта", 106949: "Отменена", 106944: "Отказ",
+STATUSES: Dict[int, str] = {
+    106939: "Открыта",
+    106941: "Переоткрыта",
+    106940: "Отложена",
+    106948: "Требует уточнения",
+    106951: "В работе",
+    106946: "Выполнена",
+    106947: "ВыполнTest",
+    106943: "Проверена",
+    106942: "ВыполнProd",
+    106945: "Сделка (заключен договор)",
+    106950: "Закрыта",
+    106949: "Отменена",
+    106944: "Отказ",
 }
-FINAL_STATUSES = {106950, 106949, 106946}
+FINAL_STATUSES: set[int] = {106950, 106949, 106946}
+# В каких финальных статусах показываем запрос оценки
+RATING_FINAL_STATUSES: set[int] = {106950, 106946}
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 log = logging.getLogger("idk_webhook")
 UTC = pytz.UTC
 
@@ -54,7 +69,8 @@ def get_db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     with conn:
         conn.execute(
-            """CREATE TABLE IF NOT EXISTS tickets(
+            """
+            CREATE TABLE IF NOT EXISTS tickets(
                 ticket_id TEXT PRIMARY KEY,
                 task_number TEXT,
                 chat_id INTEGER,
@@ -68,52 +84,83 @@ def get_db() -> sqlite3.Connection:
                 last_engineer_comment TEXT,
                 last_notified_reminder TEXT,
                 status_changed_at TEXT
-            )"""
+            )
+            """
         )
         conn.execute(
-            """CREATE TABLE IF NOT EXISTS user_comments(
+            """
+            CREATE TABLE IF NOT EXISTS user_comments(
                 ticket_id TEXT,
                 comment_text TEXT,
                 PRIMARY KEY(ticket_id, comment_text)
-            )"""
+            )
+            """
         )
         conn.commit()
     return conn
 
+
 DB = get_db()
+
 
 def get_ticket_row(ticket_id: str) -> Optional[sqlite3.Row]:
     return DB.execute(
-        "SELECT ticket_id, task_number, chat_id, user_id, last_user_message_id, status FROM tickets WHERE ticket_id = ?",
+        """
+        SELECT ticket_id, task_number, chat_id, user_id, last_user_message_id, status
+        FROM tickets
+        WHERE ticket_id = ?
+        """,
         (ticket_id,),
     ).fetchone()
+
 
 def clear_user_comments(ticket_id: str) -> None:
     with DB:
         DB.execute("DELETE FROM user_comments WHERE ticket_id = ?", (ticket_id,))
 
+
 def user_comment_exists(ticket_id: str, text: str) -> bool:
     norm = _normalize_for_db(text)
-    row = DB.execute("SELECT 1 FROM user_comments WHERE ticket_id = ? AND comment_text = ?", (ticket_id, norm)).fetchone()
+    row = DB.execute(
+        "SELECT 1 FROM user_comments WHERE ticket_id = ? AND comment_text = ?",
+        (ticket_id, norm),
+    ).fetchone()
     return row is not None
+
 
 def save_user_comment_db(ticket_id: str, text: str) -> None:
     norm = _normalize_for_db(text)
     with DB:
-        DB.execute("INSERT OR IGNORE INTO user_comments (ticket_id, comment_text) VALUES (?, ?)", (ticket_id, norm))
+        DB.execute(
+            "INSERT OR IGNORE INTO user_comments (ticket_id, comment_text) VALUES (?, ?)",
+            (ticket_id, norm),
+        )
+
 
 def update_ticket_status(ticket_id: str, new_status: Optional[int]) -> bool:
-    row = DB.execute("SELECT status FROM tickets WHERE ticket_id = ?", (ticket_id,)).fetchone()
+    row = DB.execute(
+        "SELECT status FROM tickets WHERE ticket_id = ?",
+        (ticket_id,),
+    ).fetchone()
     if not row:
         return False
     old = row["status"]
-    changed = (new_status is not None and old != new_status)
+    changed = new_status is not None and old != new_status
     with DB:
-        DB.execute("UPDATE tickets SET status = COALESCE(?, status), last_updated = ? WHERE ticket_id = ?",
-                   (new_status, datetime.datetime.now(UTC).isoformat(), ticket_id))
+        DB.execute(
+            "UPDATE tickets SET status = COALESCE(?, status), last_updated = ? WHERE ticket_id = ?",
+            (new_status, datetime.datetime.now(UTC).isoformat(), ticket_id),
+        )
     if changed:
-        log.info("Status changed for ticket %s: %s -> %s (%s)", ticket_id, old, new_status, STATUSES.get(new_status))
+        log.info(
+            "Status changed for ticket %s: %s -> %s (%s)",
+            ticket_id,
+            old,
+            new_status,
+            STATUSES.get(new_status),
+        )
     return changed
+
 
 # ---- utils ----
 def _normalize_for_db(s: Optional[str]) -> str:
@@ -122,6 +169,7 @@ def _normalize_for_db(s: Optional[str]) -> str:
     s = re.sub(r"[\u200B\u200C\u200D\uFE0E\uFE0F]", "", str(s))
     s = re.sub(r"\s+", " ", s, flags=re.UNICODE).strip()
     return s
+
 
 def clean_intradesk_html(s: str) -> str:
     if not s:
@@ -141,6 +189,7 @@ def clean_intradesk_html(s: str) -> str:
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
     return t
 
+
 def chunk_text(text: str, limit: int = TG_LIMIT) -> List[str]:
     if len(text) <= limit:
         return [text]
@@ -158,11 +207,12 @@ def chunk_text(text: str, limit: int = TG_LIMIT) -> List[str]:
                 buf = seg
             else:
                 for i in range(0, len(seg), limit):
-                    parts.append(seg[i:i+limit])
+                    parts.append(seg[i : i + limit])
                 buf = ""
     if buf:
         parts.append(buf)
     return parts
+
 
 async def tg_send(bot: Bot, chat_id: int, text: str) -> None:
     """Отправляет обычные сообщения без reply_to."""
@@ -181,6 +231,37 @@ async def tg_send(bot: Bot, chat_id: int, text: str) -> None:
         except Exception:
             log.exception("TG: send error")
             break
+
+
+async def send_rating_prompt(
+    bot: Bot, chat_id: int, ticket_id: str, task_number: Optional[str], tg_user_id: int
+) -> Optional[int]:
+    """
+    Отправляет сообщение 'оцените заявку' с инлайн-кнопками 1..5.
+    Возвращает message_id отправленного сообщения (или None при ошибке).
+    """
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(str(i), callback_data=f"rate_{ticket_id}_{tg_user_id}_{i}") for i in range(1, 6)]]
+    )
+    text = f"Заявка #{task_number or '—'} выполнена/закрыта. Пожалуйста, оцените качество:"
+    try:
+        msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+        return msg.message_id
+    except RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        try:
+            msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+            return msg.message_id
+        except Exception:
+            log.exception("TG: send rating retry error")
+            return None
+    except Forbidden:
+        log.warning("TG: Forbidden %s (rating)", chat_id)
+        return None
+    except Exception:
+        log.exception("TG: send rating error")
+        return None
+
 
 # ---- parse helpers ----
 def try_parse_json_maybe_escaped(s: Optional[str]) -> Optional[Any]:
@@ -202,6 +283,7 @@ def try_parse_json_maybe_escaped(s: Optional[str]) -> Optional[Any]:
         pass
     return None
 
+
 def extract_from_fields_events(payload: Dict[str, Any]) -> List[str]:
     out: List[str] = []
     fields = payload.get("Fields") or payload.get("fields") or {}
@@ -217,6 +299,7 @@ def extract_from_fields_events(payload: Dict[str, Any]) -> List[str]:
                     if isinstance(nv, str) and nv.strip():
                         out.append(clean_intradesk_html(nv))
     return out
+
 
 def extract_from_lifetime(payload: Dict[str, Any]) -> List[str]:
     out: List[str] = []
@@ -234,8 +317,9 @@ def extract_from_lifetime(payload: Dict[str, Any]) -> List[str]:
                         out.append(clean_intradesk_html(text))
     return out
 
+
 def collect_comment_candidates(payload: Dict[str, Any]) -> List[str]:
-    uniq = {}
+    uniq: Dict[str, str] = {}
     for t in (extract_from_fields_events(payload) + extract_from_lifetime(payload)):
         k = _normalize_for_db(t)
         if k and k not in uniq:
@@ -248,6 +332,7 @@ def collect_comment_candidates(payload: Dict[str, Any]) -> List[str]:
             if k2 and k2 not in uniq:
                 uniq[k2] = t
     return list(uniq.values())
+
 
 def pick_status(payload: Dict[str, Any]) -> Optional[int]:
     fields = payload.get("Fields") or payload.get("fields") or {}
@@ -266,10 +351,12 @@ def pick_status(payload: Dict[str, Any]) -> Optional[int]:
     except Exception:
         return None
 
+
 # ---- app ----
 app = FastAPI(title="IDK Webhook")
 BOT = Bot(token=TELEGRAM_TOKEN)
 _seen_ids: deque[str] = deque(maxlen=5000)
+
 
 def seen_event(eid: Optional[str]) -> bool:
     if not eid:
@@ -279,9 +366,11 @@ def seen_event(eid: Optional[str]) -> bool:
     _seen_ids.append(eid)
     return False
 
+
 @app.get("/healthz")
 async def healthz():
     return PlainTextResponse("ok")
+
 
 @app.post("/idk/webhook")
 async def idk_webhook(request: Request):
@@ -301,22 +390,26 @@ async def idk_webhook(request: Request):
 
     log.info("Webhook: %s", json.dumps(payload, ensure_ascii=False)[:1200])
 
-    ticket_id = None
+    ticket_id: Optional[str] = None
     for k in ("ticket_id", "taskId", "Id", "id", "TicketId"):
         if k in payload and payload[k] is not None:
-            ticket_id = str(payload[k]); break
+            ticket_id = str(payload[k])
+            break
     if not ticket_id:
         raise HTTPException(status_code=400, detail="ticket_id missing")
 
     row = get_ticket_row(ticket_id)
     if not row:
-        return JSONResponse({"ok": False, "error": "ticket not found in bot db"}, status_code=404)
+        return JSONResponse(
+            {"ok": False, "error": "ticket not found in bot db"},
+            status_code=404,
+        )
 
     chat_id = int(row["chat_id"])
     task_number = row["task_number"]
 
     candidates = collect_comment_candidates(payload)
-    chosen_comment = None
+    chosen_comment: Optional[str] = None
     if candidates:
         chosen_comment = max(candidates, key=lambda x: len(x or ""))
         if user_comment_exists(ticket_id, chosen_comment):
@@ -325,12 +418,30 @@ async def idk_webhook(request: Request):
     status = pick_status(payload)
     status_changed = update_ticket_status(ticket_id, status)
 
+    # Если статус изменился и он финальный для оценки — отправляем кнопки
+    if status_changed and status in RATING_FINAL_STATUSES:
+        try:
+            owner_user_id = int(row["user_id"]) if row["user_id"] is not None else None
+        except Exception:
+            owner_user_id = None
+
+        if owner_user_id:
+            message_id = await send_rating_prompt(
+                BOT, chat_id, ticket_id, task_number, owner_user_id
+            )
+            if message_id:
+                with DB:
+                    DB.execute(
+                        "UPDATE tickets SET message_id = ? WHERE ticket_id = ?",
+                        (message_id, ticket_id),
+                    )
+
     # --- Отправка в TG ---
     try:
         # Больше не уведомляем о смене статуса.
         # Если пришёл комментарий инженера — отправляем только его текст.
         if chosen_comment:
-            await tg_send(BOT, chat_id, f"{chosen_comment}")
+            await tg_send(BOT, chat_id, chosen_comment)
     except Exception:
         log.exception("Ошибка отправки в Telegram")
 
@@ -340,6 +451,8 @@ async def idk_webhook(request: Request):
 
     return JSONResponse({"ok": True})
 
+
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("idk_webhook:app", host=IDK_HOST, port=IDK_PORT, reload=False)

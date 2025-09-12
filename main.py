@@ -29,7 +29,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
-from telegram.error import Forbidden, RetryAfter
+from telegram.error import Forbidden, RetryAfter, BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -1129,18 +1129,40 @@ async def handle_rating(update: Update, context: ContextTypes.DEFAULT_TYPE, conn
     await query.answer()
     _, ticket_id, expected_user_id, rating = query.data.split("_")
     user = query.from_user
-    chat_id = query.message.chat_id
+    chat_id = query.message.chat_id if query.message else update.effective_chat.id
 
-    chat_id_db, user_id_db, message_id, last_user_message_id_db, last_updated, status, last_comment_db, notified_status, last_engineer_comment, last_notified_reminder, task_number = get_ticket_info(conn, ticket_id)
+    chat_id_db, user_id_db, message_id, last_user_message_id_db, last_updated, status, \
+        last_comment_db, notified_status, last_engineer_comment, last_notified_reminder, task_number = get_ticket_info(conn, ticket_id)
+
+    # только владелец заявки может оценивать
     if str(user.id) != expected_user_id or user.id != user_id_db:
-        await query.edit_message_text("Вы не можете оценить эту заявку, так как она не ваша!", parse_mode="HTML")
+        try:
+            await query.edit_message_text("Вы не можете оценить эту заявку, так как она не ваша!", parse_mode="HTML")
+        except BadRequest:
+            # если сообщение уже удалено — просто молча игнорируем
+            pass
         return
 
     if update_ticket_evaluation(ticket_id, rating):
         text = "Спасибо за оценку, ваше мнение важно для нас!"
+
+        # 1) СНАЧАЛА пытаемся отредактировать сообщение с кнопками
+        try:
+            await query.edit_message_text(text, parse_mode="HTML")
+        except BadRequest:
+            # Если сообщение уже удалено/недоступно — отправим отдельное сообщение благодарности
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+            except Exception as e:
+                logger.warning("Не удалось отправить благодарность: %s", e)
+
+        # 2) ПОТОМ удаляем сохранённое сообщение (если оно ещё есть)
         if message_id:
             try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                # если это то же сообщение, которое мы только что редактировали — пропустим удаление
+                same_msg = query.message and (message_id == query.message.message_id)
+                if not same_msg:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
                 with conn:
                     c = conn.cursor()
                     c.execute("UPDATE tickets SET message_id = 0 WHERE ticket_id = ?", (ticket_id,))
@@ -1148,8 +1170,10 @@ async def handle_rating(update: Update, context: ContextTypes.DEFAULT_TYPE, conn
             except Exception as e:
                 logger.warning("Не удалось удалить сообщение %s: %s", message_id, e)
     else:
-        text = f"Ошибка при сохранении оценки для заявки #{task_number}!"
-    await query.edit_message_text(text, parse_mode="HTML")
+        try:
+            await query.edit_message_text(f"Ошибка при сохранении оценки для заявки #{task_number}!", parse_mode="HTML")
+        except BadRequest:
+            pass
 
 
 async def check_ticket_status(context: ContextTypes.DEFAULT_TYPE, conn: sqlite3.Connection) -> None:
