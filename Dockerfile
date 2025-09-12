@@ -20,8 +20,6 @@ COPY config.ini ./
 # дефолтный конфиг (перекрывается volume-ом)
 COPY main.py ./                  
 # точка входа бота
-COPY modules ./modules          
-# все модули бота
 COPY idk_webhook.py ./           
 # сервис вебхуков от IntraDesk (uvicorn)
 
