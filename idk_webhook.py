@@ -60,6 +60,7 @@ RATING_FINAL_STATUSES: set[int] = {106950, 106946}
 NOTIFY_STATUSES: set[int] = {
     int(x) for x in re.split(r"[,\s]+", config.get("App", "notify_statuses", fallback="106948").strip()) if x
 }
+IN_WORK_STATUS: int = int(config.get("App", "in_work_status_id", fallback="106951"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -498,7 +499,27 @@ async def idk_webhook(request: Request):
     if chosen_comment:
         await tg_send(BOT, chat_id, chosen_comment, reply_to_message_id=reply_to_id)
 
-    # 2) Если статус стал "требует уточнения" — отправляем просьбу ответить (однократно)
+    # 2) Если статус стал "в работе" — отправляем уведомление (однократно)
+    if status_changed and status == IN_WORK_STATUS:
+        notified_val = DB.execute(
+            "SELECT notified_status FROM tickets WHERE ticket_id = ?",
+            (ticket_id,),
+        ).fetchone()
+        already_notified = bool(
+            notified_val and notified_val[0] is not None and int(notified_val[0]) == int(status)
+        )
+
+        if not already_notified:
+            inwork_text = f"Заявка #{task_number or '—'} принята в работу."
+            await tg_send(BOT, chat_id, inwork_text, reply_to_message_id=reply_to_id)
+            now_iso = datetime.datetime.now(UTC).isoformat()
+            with DB:
+                DB.execute(
+                    "UPDATE tickets SET notified_status = ?, status_changed_at = ? WHERE ticket_id = ?",
+                    (int(status), now_iso, ticket_id),
+                )
+    
+    # 2.1) Если статус стал "требует уточнения" — отправляем просьбу ответить (однократно)
     if status_changed and status in NOTIFY_STATUSES:
         notified_val = DB.execute(
             "SELECT notified_status FROM tickets WHERE ticket_id = ?",
