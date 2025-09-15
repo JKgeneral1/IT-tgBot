@@ -168,6 +168,16 @@ def update_ticket_status(ticket_id: str, new_status: Optional[int]) -> bool:
             STATUSES.get(new_status),
         )
     return changed
+    
+def _reply_kwargs(chat_id: int, reply_to_message_id: Optional[int]) -> Dict[str, int]:
+    """
+    Поведение как в helptp.py: reply только в группах (chat_id < 0).
+    В личке — без reply_to.
+    """
+    if chat_id < 0 and reply_to_message_id:
+        return {"reply_to_message_id": int(reply_to_message_id)}
+    return {}
+
 
 
 # ---- utils ----
@@ -222,17 +232,25 @@ def chunk_text(text: str, limit: int = TG_LIMIT) -> List[str]:
     return parts
 
 
-async def tg_send(bot: Bot, chat_id: int, text: str) -> None:
-    """Отправляет обычные сообщения без reply_to."""
+async def tg_send(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    reply_to_message_id: Optional[int] = None,
+) -> None:
+    """Отправляет текст. В группах первый кусок отправляется reply на сообщение пользователя."""
     pieces = chunk_text(text)
     total = len(pieces)
     for i, piece in enumerate(pieces, start=1):
         piece_to_send = piece if total == 1 else (piece if i == 1 else f"(продолжение {i}/{total})\n{piece}")
+        kwargs = {}
+        if i == 1:
+            kwargs.update(_reply_kwargs(chat_id, reply_to_message_id))
         try:
-            await bot.send_message(chat_id, piece_to_send)
+            await bot.send_message(chat_id, piece_to_send, **kwargs)
         except RetryAfter as e:
             await asyncio.sleep(e.retry_after)
-            await bot.send_message(chat_id, piece_to_send)
+            await bot.send_message(chat_id, piece_to_send, **kwargs)
         except Forbidden:
             log.warning("TG: Forbidden %s", chat_id)
             break
@@ -241,24 +259,36 @@ async def tg_send(bot: Bot, chat_id: int, text: str) -> None:
             break
 
 
+
 async def send_rating_prompt(
-    bot: Bot, chat_id: int, ticket_id: str, task_number: Optional[str], tg_user_id: int
+    bot: Bot,
+    chat_id: int,
+    ticket_id: str,
+    task_number: Optional[str],
+    tg_user_id: int,
+    reply_to_message_id: Optional[int] = None,
 ) -> Optional[int]:
-    """
-    Отправляет сообщение 'оцените заявку' с инлайн-кнопками 1..5.
-    Возвращает message_id отправленного сообщения (или None при ошибке).
-    """
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(str(i), callback_data=f"rate_{ticket_id}_{tg_user_id}_{i}") for i in range(1, 6)]]
-    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(str(i), callback_data=f"rate_{ticket_id}_{tg_user_id}_{i}") for i in range(1, 6)]
+    ])
     text = f"Заявка #{task_number or '—'} выполнена/закрыта. Пожалуйста, оцените качество:"
     try:
-        msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+        msg = await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=kb,
+            **_reply_kwargs(chat_id, reply_to_message_id),
+        )
         return msg.message_id
     except RetryAfter as e:
         await asyncio.sleep(e.retry_after)
         try:
-            msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+            msg = await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=kb,
+                **_reply_kwargs(chat_id, reply_to_message_id),
+            )
             return msg.message_id
         except Exception:
             log.exception("TG: send rating retry error")
@@ -269,6 +299,7 @@ async def send_rating_prompt(
     except Exception:
         log.exception("TG: send rating error")
         return None
+
 
 
 # ---- parse helpers ----
@@ -415,6 +446,9 @@ async def idk_webhook(request: Request):
 
     chat_id = int(row["chat_id"])
     task_number = row["task_number"]
+    last_uid = int(row["last_user_message_id"] or 0)
+    reply_to_id = last_uid if last_uid > 0 else None
+
 
     candidates = collect_comment_candidates(payload)
     chosen_comment: Optional[str] = None
@@ -426,7 +460,11 @@ async def idk_webhook(request: Request):
     status = pick_status(payload)
     status_changed = update_ticket_status(ticket_id, status)
 
-    # Если статус изменился и он финальный для оценки — отправляем кнопки
+    # 1) Если есть комментарий инженера — отправляем ЕГО ПЕРВЫМ (reply в группах)
+    if chosen_comment:
+        await tg_send(BOT, chat_id, chosen_comment, reply_to_message_id=reply_to_id)
+
+    # 2) Если статус стал финальным — отправляем опрос оценки (после комментария)
     if status_changed and status in RATING_FINAL_STATUSES:
         try:
             owner_user_id = int(row["user_id"]) if row["user_id"] is not None else None
@@ -435,7 +473,7 @@ async def idk_webhook(request: Request):
 
         if owner_user_id:
             message_id = await send_rating_prompt(
-                BOT, chat_id, ticket_id, task_number, owner_user_id
+                BOT, chat_id, ticket_id, task_number, owner_user_id, reply_to_message_id=reply_to_id
             )
             if message_id:
                 with DB:
@@ -444,14 +482,7 @@ async def idk_webhook(request: Request):
                         (message_id, ticket_id),
                     )
 
-    # --- Отправка в TG ---
-    try:
-        # Больше не уведомляем о смене статуса.
-        # Если пришёл комментарий инженера — отправляем только его текст.
-        if chosen_comment:
-            await tg_send(BOT, chat_id, chosen_comment)
-    except Exception:
-        log.exception("Ошибка отправки в Telegram")
+
 
     # Чистим кэш комментариев пользователя при финальных статусах
     if status is not None and status in FINAL_STATUSES:
