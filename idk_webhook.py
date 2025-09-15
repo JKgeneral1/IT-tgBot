@@ -23,6 +23,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import RetryAfter, Forbidden
+from difflib import SequenceMatcher
 
 # ---- конфиг ----
 config = configparser.ConfigParser()
@@ -121,18 +122,40 @@ def clear_user_comments(ticket_id: str) -> None:
 
 def user_comment_exists(ticket_id: str, text: str) -> bool:
     """
-    Проверяем, что такой же пользовательский комментарий уже есть в БД.
-    Сравнение по нормализованной форме (убираем ZWJ/VS и схлопываем пробелы),
-    чтобы цепочки эмодзи не давали эхо.
+    Анти-эхо: считаем дублирующимся, если:
+    - мягко-нормализованные строки равны, ИЛИ
+    - одна из строго-нормализованных строк является подстрокой другой (длина >= 24), ИЛИ
+    - схожесть по SequenceMatcher >= 0.88 при длине >= 24 символов.
     """
-    target = _normalize_for_db(text)
+    if not text:
+        return False
+
+    e_soft = _normalize_for_db(text)
+    e_strict = _normalize_strict(text)
+
     rows = DB.execute(
         "SELECT comment_text FROM user_comments WHERE ticket_id = ?",
         (ticket_id,),
     ).fetchall()
+
     for r in rows or []:
-        if _normalize_for_db(r["comment_text"]) == target:
+        u_soft = _normalize_for_db(r["comment_text"])
+        if not u_soft:
+            continue
+        if u_soft == e_soft:
             return True
+
+        u_strict = _normalize_strict(u_soft)
+
+        # Подстрока (для длинных сообщений/много строк)
+        if len(u_strict) >= 24 and (u_strict in e_strict or e_strict in u_strict):
+            return True
+
+        # Похожесть (когда инженер добавил/удалил немного)
+        if len(u_soft) >= 24 and len(e_soft) >= 24:
+            if SequenceMatcher(None, u_soft, e_soft).ratio() >= 0.88:
+                return True
+
     return False
 
 
@@ -182,11 +205,21 @@ def _reply_kwargs(chat_id: int, reply_to_message_id: Optional[int]) -> Dict[str,
 
 # ---- utils ----
 def _normalize_for_db(s: Optional[str]) -> str:
+    """Мягкая нормализация: убираем VS/ZWJ, схлопываем пробелы, понижаем регистр."""
     if not s:
         return ""
-    s = re.sub(r"[\u200B\u200C\u200D\uFE0E\uFE0F]", "", str(s))
+    s = str(s)
+    s = re.sub(r"[\u200B\u200C\u200D\uFE0E\uFE0F]", "", s)  # скрытые селекторы/ZWJ
+    s = re.sub(r"\r\n?", "\n", s)
     s = re.sub(r"\s+", " ", s, flags=re.UNICODE).strip()
-    return s
+    return s.lower()
+
+def _normalize_strict(s: Optional[str]) -> str:
+    """Строгая нормализация: только буквы/цифры, без пробелов/знаков — для substring/ratio-сравнений."""
+    soft = _normalize_for_db(s)
+    # \w в Python включает Unicode-буквы и цифры, оставляем только их
+    return re.sub(r"[\W_]+", "", soft, flags=re.UNICODE)
+
 
 
 def clean_intradesk_html(s: str) -> str:
