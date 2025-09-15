@@ -3,7 +3,7 @@
 idk_webhook.py — приёмник вебхуков от IntraDesk (FastAPI).
 Парсит комментарии и статусы; шлёт сообщения в Telegram; хранит минимум в SQLite.
 
-Изменение: отключены уведомления о смене статуса.
+Изменение: нет фоновых уведомлений о смене статуса — всё через вебхуки.
 """
 
 import asyncio
@@ -37,7 +37,7 @@ IDK_PORT: int = int(config.get("Web", "idk_port", fallback="8081"))
 DB_FILE: str = config.get("App", "db_file", fallback="/data/tickets.db")
 TG_LIMIT: int = int(config.get("App", "tg_limit", fallback="3500"))
 
-# Можно оставить для внутреннего логирования/совместимости, но в Telegram не используем
+# Карта статусов (для логов)
 STATUSES: Dict[int, str] = {
     106939: "Открыта",
     106941: "Переоткрыта",
@@ -56,6 +56,10 @@ STATUSES: Dict[int, str] = {
 FINAL_STATUSES: set[int] = {106950, 106949, 106946}
 # В каких финальных статусах показываем запрос оценки
 RATING_FINAL_STATUSES: set[int] = {106950, 106946}
+# Статусы, при которых просим пользователя ответить (как раньше с 99218)
+NOTIFY_STATUSES: set[int] = {
+    int(x) for x in re.split(r"[,\s]+", config.get("App", "notify_statuses", fallback="106948").strip()) if x
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -118,6 +122,24 @@ def get_ticket_row(ticket_id: str) -> Optional[sqlite3.Row]:
 def clear_user_comments(ticket_id: str) -> None:
     with DB:
         DB.execute("DELETE FROM user_comments WHERE ticket_id = ?", (ticket_id,))
+
+
+# ---- анти-эхо ----
+def _normalize_for_db(s: Optional[str]) -> str:
+    """Мягкая нормализация: убираем VS/ZWJ, схлопываем пробелы, приводим к нижнему регистру."""
+    if not s:
+        return ""
+    s = str(s)
+    s = re.sub(r"[\u200B\u200C\u200D\uFE0E\uFE0F]", "", s)  # скрытые селекторы/ZWJ
+    s = re.sub(r"\r\n?", "\n", s)
+    s = re.sub(r"\s+", " ", s, flags=re.UNICODE).strip()
+    return s.lower()
+
+
+def _normalize_strict(s: Optional[str]) -> str:
+    """Строгая нормализация: оставляем только буквы и цифры (для substring/ratio-сравнений)."""
+    soft = _normalize_for_db(s)
+    return re.sub(r"[\W_]+", "", soft, flags=re.UNICODE)
 
 
 def user_comment_exists(ticket_id: str, text: str) -> bool:
@@ -185,43 +207,21 @@ def update_ticket_status(ticket_id: str, new_status: Optional[int]) -> bool:
     if changed:
         log.info(
             "Status changed for ticket %s: %s -> %s (%s)",
-            ticket_id,
-            old,
-            new_status,
-            STATUSES.get(new_status),
+            ticket_id, old, new_status, STATUSES.get(new_status),
         )
     return changed
-    
+
+
 def _reply_kwargs(chat_id: int, reply_to_message_id: Optional[int]) -> Dict[str, int]:
     """
-    Поведение как в helptp.py: reply только в группах (chat_id < 0).
-    В личке — без reply_to.
+    Поведение как в helptp.py: reply только в группах (chat_id < 0). В личке — без reply_to.
     """
     if chat_id < 0 and reply_to_message_id:
         return {"reply_to_message_id": int(reply_to_message_id)}
     return {}
 
 
-
 # ---- utils ----
-def _normalize_for_db(s: Optional[str]) -> str:
-    """Мягкая нормализация: убираем VS/ZWJ, схлопываем пробелы, понижаем регистр."""
-    if not s:
-        return ""
-    s = str(s)
-    s = re.sub(r"[\u200B\u200C\u200D\uFE0E\uFE0F]", "", s)  # скрытые селекторы/ZWJ
-    s = re.sub(r"\r\n?", "\n", s)
-    s = re.sub(r"\s+", " ", s, flags=re.UNICODE).strip()
-    return s.lower()
-
-def _normalize_strict(s: Optional[str]) -> str:
-    """Строгая нормализация: только буквы/цифры, без пробелов/знаков — для substring/ratio-сравнений."""
-    soft = _normalize_for_db(s)
-    # \w в Python включает Unicode-буквы и цифры, оставляем только их
-    return re.sub(r"[\W_]+", "", soft, flags=re.UNICODE)
-
-
-
 def clean_intradesk_html(s: str) -> str:
     if not s:
         return ""
@@ -292,7 +292,6 @@ async def tg_send(
             break
 
 
-
 async def send_rating_prompt(
     bot: Bot,
     chat_id: int,
@@ -332,7 +331,6 @@ async def send_rating_prompt(
     except Exception:
         log.exception("TG: send rating error")
         return None
-
 
 
 # ---- parse helpers ----
@@ -446,15 +444,18 @@ async def healthz():
 
 @app.post("/idk/webhook")
 async def idk_webhook(request: Request):
+    # авторизация по секрету
     secret = request.headers.get(IDK_SECRET_HEADER)
     if not IDK_SECRET_VALUE or secret != IDK_SECRET_VALUE:
         raise HTTPException(status_code=403, detail="forbidden")
 
+    # защита от дубликатов по sha1 сырых данных
     raw = await request.body()
     digest = sha1(raw).hexdigest()
     if seen_event(digest):
         return JSONResponse({"ok": True, "duplicate": True})
 
+    # парсинг JSON
     try:
         payload = json.loads(raw.decode("utf-8", errors="replace"))
     except Exception:
@@ -462,6 +463,7 @@ async def idk_webhook(request: Request):
 
     log.info("Webhook: %s", json.dumps(payload, ensure_ascii=False)[:1200])
 
+    # определяем ticket_id
     ticket_id: Optional[str] = None
     for k in ("ticket_id", "taskId", "Id", "id", "TicketId"):
         if k in payload and payload[k] is not None:
@@ -470,19 +472,17 @@ async def idk_webhook(request: Request):
     if not ticket_id:
         raise HTTPException(status_code=400, detail="ticket_id missing")
 
+    # достаём карточку из SQLite
     row = get_ticket_row(ticket_id)
     if not row:
-        return JSONResponse(
-            {"ok": False, "error": "ticket not found in bot db"},
-            status_code=404,
-        )
+        return JSONResponse({"ok": False, "error": "ticket not found in bot db"}, status_code=404)
 
     chat_id = int(row["chat_id"])
     task_number = row["task_number"]
     last_uid = int(row["last_user_message_id"] or 0)
     reply_to_id = last_uid if last_uid > 0 else None
 
-
+    # собираем возможные комментарии инженера
     candidates = collect_comment_candidates(payload)
     chosen_comment: Optional[str] = None
     if candidates:
@@ -490,6 +490,7 @@ async def idk_webhook(request: Request):
         if user_comment_exists(ticket_id, chosen_comment):
             chosen_comment = None  # эхо пользователя
 
+    # статус
     status = pick_status(payload)
     status_changed = update_ticket_status(ticket_id, status)
 
@@ -497,7 +498,30 @@ async def idk_webhook(request: Request):
     if chosen_comment:
         await tg_send(BOT, chat_id, chosen_comment, reply_to_message_id=reply_to_id)
 
-    # 2) Если статус стал финальным — отправляем опрос оценки (после комментария)
+    # 2) Если статус стал "требует уточнения" — отправляем просьбу ответить (однократно)
+    if status_changed and status in NOTIFY_STATUSES:
+        notified_val = DB.execute(
+            "SELECT notified_status FROM tickets WHERE ticket_id = ?",
+            (ticket_id,),
+        ).fetchone()
+        already_notified = bool(
+            notified_val and notified_val[0] is not None and int(notified_val[0]) == int(status)
+        )
+
+        if not already_notified:
+            notify_text = (
+                f"Заявка #{task_number or '—'} требует вашего ответа — добавьте комментарий "
+                f"или, если заявка уже не актуальна, мы её закроем!"
+            )
+            await tg_send(BOT, chat_id, notify_text, reply_to_message_id=reply_to_id)
+            now_iso = datetime.datetime.now(UTC).isoformat()
+            with DB:
+                DB.execute(
+                    "UPDATE tickets SET notified_status = ?, status_changed_at = ? WHERE ticket_id = ?",
+                    (int(status), now_iso, ticket_id),
+                )
+
+    # 3) Если статус финальный — отправляем опрос оценки (после комментария/уведомления)
     if status_changed and status in RATING_FINAL_STATUSES:
         try:
             owner_user_id = int(row["user_id"]) if row["user_id"] is not None else None
@@ -515,9 +539,7 @@ async def idk_webhook(request: Request):
                         (message_id, ticket_id),
                     )
 
-
-
-    # Чистим кэш комментариев пользователя при финальных статусах
+    # Чистим кэш пользовательских комментов при финальных статусах
     if status is not None and status in FINAL_STATUSES:
         clear_user_comments(ticket_id)
 
@@ -526,5 +548,4 @@ async def idk_webhook(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("idk_webhook:app", host=IDK_HOST, port=IDK_PORT, reload=False)
