@@ -13,6 +13,7 @@ import html
 import json
 import logging
 import re
+import os
 import sqlite3
 from collections import deque
 from hashlib import sha1
@@ -70,7 +71,13 @@ log = logging.getLogger("idk_webhook")
 UTC = pytz.UTC
 
 # ---- DB ----
+import os
+# остальные импорты...
+
 def get_db() -> sqlite3.Connection:
+    # создаём каталог под БД, если его нет
+    os.makedirs(os.path.dirname(DB_FILE) or ".", exist_ok=True)
+
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     with conn:
@@ -104,6 +111,7 @@ def get_db() -> sqlite3.Connection:
         )
         conn.commit()
     return conn
+
 
 
 DB = get_db()

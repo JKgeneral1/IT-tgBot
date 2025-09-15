@@ -56,6 +56,8 @@ _LEVEL_MAP = {
 log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
 log_level = _LEVEL_MAP.get(log_level_name, logging.INFO)
 
+
+
 logging.basicConfig(
     level=log_level,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -97,6 +99,12 @@ OPEN_STATUS_ID: int = int(config["App"].get("open_status_id", "106939"))
 REOPEN_STATUSES: set[int] = {int(x) for x in re.split(r"[,\s]+", config["App"].get("reopen_statuses", "106941,106940,106948").strip()) if x}
 FINAL_STATUSES: set[int] = {int(x) for x in re.split(r"[,\s]+", config["App"].get("final_statuses", "106950,106949,106946").strip()) if x}
 NOTIFY_STATUSES: set[int] = {int(x) for x in re.split(r"[,\s]+", config["App"].get("notify_statuses", "106948").strip()) if x}
+
+# создаём каталог под БД, если его нет
+db_dir = os.path.dirname(DB_FILE) or "."
+os.makedirs(db_dir, exist_ok=True)
+
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 
 # === Автоперевод статуса при комментарии пользователя ===
 def _parse_status_map(raw: str) -> Dict[int, int]:
